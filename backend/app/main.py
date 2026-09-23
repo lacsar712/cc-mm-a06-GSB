@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
@@ -6,10 +7,14 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
-from sqlalchemy import DateTime, Float, String, create_engine
+from sqlalchemy import DateTime, Float, String, Text, create_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from app.rules import classify
+
+PREFIX_MIN = 1
+PREFIX_MAX = 8
+DEFAULT_PREFIX_LENGTH = 2
 
 
 class Settings(BaseSettings):
@@ -44,6 +49,22 @@ class Reading(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class HeatSetting(Base):
+    __tablename__ = "heat_settings"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    prefix_length: Mapped[int]
+
+
+class HeatSnapshot(Base):
+    __tablename__ = "heat_snapshots"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    prefix_length: Mapped[int]
+    created_by: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    groups_json: Mapped[str] = mapped_column(Text)
+    hit_ids_json: Mapped[str] = mapped_column(Text)
+
+
 class LoginIn(BaseModel):
     username: str
     password: str
@@ -52,6 +73,10 @@ class LoginIn(BaseModel):
 class ReadingIn(BaseModel):
     site: str = Field(min_length=1, max_length=80)
     ch4_pct: float
+
+
+class PrefixLengthIn(BaseModel):
+    prefix_length: int = Field(ge=PREFIX_MIN, le=PREFIX_MAX)
 
 
 def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(security)) -> dict:
@@ -70,6 +95,12 @@ def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(secu
 def require_writer(user: dict = Depends(current_user)) -> dict:
     if user["role"] != "writer":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="仅瓦斯检查员可上报")
+    return user
+
+
+def require_inspector(user: dict = Depends(current_user)) -> dict:
+    if user["role"] != "writer":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="仅瓦斯检查员可操作")
     return user
 
 
@@ -96,7 +127,9 @@ def startup():
                         created_at=now,
                     )
                 )
-            db.commit()
+        if db.query(HeatSetting).count() == 0:
+            db.add(HeatSetting(id=1, prefix_length=DEFAULT_PREFIX_LENGTH))
+        db.commit()
     finally:
         db.close()
 
@@ -179,3 +212,115 @@ async def alerts(ws: WebSocket):
             await ws.receive_text()
     except WebSocketDisconnect:
         sockets.discard(ws)
+
+
+def build_heat_groups(db: Session, prefix_length: int) -> list[dict]:
+    rows = db.query(Reading).order_by(Reading.id.asc()).all()
+    groups: dict[str, dict] = {}
+    for r in rows:
+        key = r.site[:prefix_length]
+        bucket = groups.get(key)
+        if bucket is None:
+            bucket = {"prefix": key, "alarm_count": 0, "normal_count": 0, "hit_ids": []}
+            groups[key] = bucket
+        if r.level == "报警":
+            bucket["alarm_count"] += 1
+            bucket["hit_ids"].append(r.id)
+        else:
+            bucket["normal_count"] += 1
+    return list(groups.values())
+
+
+def get_prefix_length(db: Session) -> int:
+    setting = db.get(HeatSetting, 1)
+    return setting.prefix_length if setting else DEFAULT_PREFIX_LENGTH
+
+
+def serialize_snapshot(snap: HeatSnapshot) -> dict:
+    return {
+        "id": snap.id,
+        "prefix_length": snap.prefix_length,
+        "created_by": snap.created_by,
+        "created_at": snap.created_at.isoformat(),
+        "groups": json.loads(snap.groups_json),
+        "hit_ids": json.loads(snap.hit_ids_json),
+    }
+
+
+@app.get("/api/heat/live")
+def heat_live(_user: dict = Depends(current_user)):
+    db = SessionLocal()
+    try:
+        prefix_length = get_prefix_length(db)
+        return {"prefix_length": prefix_length, "groups": build_heat_groups(db, prefix_length)}
+    finally:
+        db.close()
+
+
+@app.put("/api/heat/prefix")
+def set_heat_prefix(body: PrefixLengthIn, _user: dict = Depends(require_inspector)):
+    db = SessionLocal()
+    try:
+        setting = db.get(HeatSetting, 1)
+        if setting is None:
+            setting = HeatSetting(id=1, prefix_length=body.prefix_length)
+            db.add(setting)
+        else:
+            setting.prefix_length = body.prefix_length
+        db.commit()
+        return {"prefix_length": setting.prefix_length}
+    finally:
+        db.close()
+
+
+@app.post("/api/heat/snapshots", status_code=201)
+def create_heat_snapshot(user: dict = Depends(require_inspector)):
+    db = SessionLocal()
+    try:
+        prefix_length = get_prefix_length(db)
+        groups = build_heat_groups(db, prefix_length)
+        hit_ids = sorted(hid for g in groups for hid in g["hit_ids"])
+        snap = HeatSnapshot(
+            prefix_length=prefix_length,
+            created_by=user["username"],
+            created_at=datetime.now(timezone.utc),
+            groups_json=json.dumps(groups, ensure_ascii=False),
+            hit_ids_json=json.dumps(hit_ids),
+        )
+        db.add(snap)
+        db.commit()
+        db.refresh(snap)
+        return serialize_snapshot(snap)
+    finally:
+        db.close()
+
+
+@app.get("/api/heat/snapshots")
+def list_heat_snapshots(_user: dict = Depends(current_user)):
+    db = SessionLocal()
+    try:
+        snaps = db.query(HeatSnapshot).order_by(HeatSnapshot.id.desc()).all()
+        return [
+            {
+                "id": s.id,
+                "prefix_length": s.prefix_length,
+                "created_by": s.created_by,
+                "created_at": s.created_at.isoformat(),
+                "hit_ids": json.loads(s.hit_ids_json),
+            }
+            for s in snaps
+        ]
+    finally:
+        db.close()
+
+
+@app.get("/api/heat/snapshots/{snapshot_id}")
+def get_heat_snapshot(snapshot_id: int, _user: dict = Depends(current_user)):
+    db = SessionLocal()
+    try:
+        snap = db.get(HeatSnapshot, snapshot_id)
+        if snap is None:
+            raise HTTPException(status_code=404, detail="快照不存在")
+        return serialize_snapshot(snap)
+    finally:
+        db.close()
