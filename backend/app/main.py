@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
@@ -6,7 +7,7 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
-from sqlalchemy import DateTime, Float, String, create_engine
+from sqlalchemy import DateTime, Float, Integer, String, Text, create_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from app.rules import classify
@@ -44,6 +45,22 @@ class Reading(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class Setting(Base):
+    __tablename__ = "settings"
+    key: Mapped[str] = mapped_column(String(40), primary_key=True)
+    value: Mapped[str] = mapped_column(String(120))
+
+
+class HeatSnapshot(Base):
+    __tablename__ = "heat_snapshots"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    prefix_len: Mapped[int] = mapped_column(Integer)
+    # 冻结内容：[{"prefix": "回风", "alarm": 1, "ok": 0, "row_ids": [2]}, ...]
+    groups_json: Mapped[str] = mapped_column(Text)
+    created_by: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class LoginIn(BaseModel):
     username: str
     password: str
@@ -52,6 +69,50 @@ class LoginIn(BaseModel):
 class ReadingIn(BaseModel):
     site: str = Field(min_length=1, max_length=80)
     ch4_pct: float
+
+
+class PrefixLenIn(BaseModel):
+    prefix_len: int = Field(ge=1, le=20)
+
+
+DEFAULT_PREFIX_LEN = 2
+
+
+def get_prefix_len(db: Session) -> int:
+    row = db.get(Setting, "prefix_len")
+    if row is None:
+        return DEFAULT_PREFIX_LEN
+    try:
+        value = int(row.value)
+    except ValueError:
+        return DEFAULT_PREFIX_LEN
+    return value if 1 <= value <= 20 else DEFAULT_PREFIX_LEN
+
+
+def set_prefix_len(db: Session, prefix_len: int) -> None:
+    row = db.get(Setting, "prefix_len")
+    if row is None:
+        db.add(Setting(key="prefix_len", value=str(prefix_len)))
+    else:
+        row.value = str(prefix_len)
+    db.commit()
+
+
+def heat_groups(db: Session, prefix_len: int) -> list[dict]:
+    """按巷道名前 prefix_len 个字分组，统计报警/正常条数与命中行编号。"""
+    groups: dict[str, dict] = {}
+    for r in db.query(Reading).order_by(Reading.id.asc()).all():
+        prefix = r.site.strip()[:prefix_len]
+        bucket = groups.setdefault(
+            prefix,
+            {"prefix": prefix, "alarm": 0, "ok": 0, "row_ids": []},
+        )
+        if r.level == "报警":
+            bucket["alarm"] += 1
+        else:
+            bucket["ok"] += 1
+        bucket["row_ids"].append(r.id)
+    return sorted(groups.values(), key=lambda g: (-g["alarm"], g["prefix"]))
 
 
 def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(security)) -> dict:
@@ -168,6 +229,98 @@ async def create_reading(body: ReadingIn, user: dict = Depends(require_writer)):
     for ws in dead:
         sockets.discard(ws)
     return payload
+
+
+@app.get("/api/heat/prefix-len")
+def get_heat_prefix_len(_user: dict = Depends(current_user)):
+    db = SessionLocal()
+    try:
+        return {"prefix_len": get_prefix_len(db)}
+    finally:
+        db.close()
+
+
+@app.put("/api/heat/prefix-len")
+def update_heat_prefix_len(body: PrefixLenIn, user: dict = Depends(require_writer)):
+    db = SessionLocal()
+    try:
+        set_prefix_len(db, body.prefix_len)
+    finally:
+        db.close()
+    return {"prefix_len": body.prefix_len}
+
+
+@app.get("/api/heat/table")
+def heat_table(_user: dict = Depends(current_user)):
+    db = SessionLocal()
+    try:
+        prefix_len = get_prefix_len(db)
+        return {"prefix_len": prefix_len, "groups": heat_groups(db, prefix_len)}
+    finally:
+        db.close()
+
+
+@app.get("/api/heat/snapshots")
+def list_heat_snapshots(_user: dict = Depends(current_user)):
+    db = SessionLocal()
+    try:
+        rows = db.query(HeatSnapshot).order_by(HeatSnapshot.id.desc()).all()
+        return [
+            {
+                "id": s.id,
+                "prefix_len": s.prefix_len,
+                "created_by": s.created_by,
+                "created_at": s.created_at.isoformat(),
+                "group_count": len(json.loads(s.groups_json)),
+            }
+            for s in rows
+        ]
+    finally:
+        db.close()
+
+
+@app.post("/api/heat/snapshots", status_code=201)
+def create_heat_snapshot(user: dict = Depends(require_writer)):
+    db = SessionLocal()
+    try:
+        prefix_len = get_prefix_len(db)
+        groups = heat_groups(db, prefix_len)
+        row = HeatSnapshot(
+            prefix_len=prefix_len,
+            groups_json=json.dumps(groups, ensure_ascii=False),
+            created_by=user["username"],
+            created_at=datetime.now(timezone.utc),
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return {
+            "id": row.id,
+            "prefix_len": row.prefix_len,
+            "groups": groups,
+            "created_by": row.created_by,
+            "created_at": row.created_at.isoformat(),
+        }
+    finally:
+        db.close()
+
+
+@app.get("/api/heat/snapshots/{snapshot_id}")
+def get_heat_snapshot(snapshot_id: int, _user: dict = Depends(current_user)):
+    db = SessionLocal()
+    try:
+        row = db.get(HeatSnapshot, snapshot_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="快照不存在")
+        return {
+            "id": row.id,
+            "prefix_len": row.prefix_len,
+            "groups": json.loads(row.groups_json),
+            "created_by": row.created_by,
+            "created_at": row.created_at.isoformat(),
+        }
+    finally:
+        db.close()
 
 
 @app.websocket("/ws/alerts")
